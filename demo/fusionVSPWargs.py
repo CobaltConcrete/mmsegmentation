@@ -25,7 +25,7 @@ FRAME_WIDTH_CUSTOM = 1920
 FRAME_HEIGHT_CUSTOM = 540
 FUSION_THRESHOLD = 0
 
-BASE_DIR = "/content/drive/MyDrive/ureca/mmsegmentation"
+BASE_DIR = "/home/r13qingrong/Projects/URECA/mmsegmentation"
 DATA_DIR = f"{BASE_DIR}/data/VSPW/data"
 VIDEO_DIR = os.path.join(DATA_DIR, VIDEO_NAME)
 IMAGE_DIR = os.path.join(VIDEO_DIR, "origin")
