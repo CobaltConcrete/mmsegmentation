@@ -375,6 +375,7 @@ for image_path, mask_path in zip(image_paths, mask_paths):
     # if cv2.waitKey(1) & 0xFF == ord("q"):
     #     break
 
+
 if METRICS_FOR_CLASSES:
     save_metrics_to_csv_classes(f"VSPW_segmentation_metrics_mobilenetv3_{FUSION_THRESHOLD}.csv", VIDEO_NAME, FUSION_THRESHOLD, avg_metrics_normal, avg_metrics_overwritten, num_frames)
 else:
