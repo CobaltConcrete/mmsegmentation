@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from typing import Dict, List, Optional
 
+import time
 import cv2
 import mmcv
 import numpy as np
@@ -103,7 +104,7 @@ class SegLocalVisualizer(Visualizer):
                       sem_seg: PixelData,
                       classes: Optional[List],
                       palette: Optional[List],
-                      with_labels: Optional[bool] = True) -> np.ndarray:
+                      with_labels: Optional[bool] = False) -> np.ndarray:
         """Draw semantic seg of GT or prediction.
 
         Args:
@@ -125,6 +126,10 @@ class SegLocalVisualizer(Visualizer):
         Returns:
             np.ndarray: the drawn image which channel is RGB.
         """
+        # classes += ('Unknown',)
+        # if len(palette) < len(classes):
+        #     palette.append([255, 0, 0])
+
         num_classes = len(classes)
 
         sem_seg = sem_seg.cpu().data
@@ -139,7 +144,7 @@ class SegLocalVisualizer(Visualizer):
         for label, color in zip(labels, colors):
             mask[sem_seg[0] == label, :] = color
 
-        if with_labels:
+        if False:
             font = cv2.FONT_HERSHEY_SIMPLEX
             # (0,1] to change the size of the text relative to the image
             scale = 0.05
@@ -157,6 +162,7 @@ class SegLocalVisualizer(Visualizer):
                 masks = sem_seg[0].numpy() == labels[:, None, None]
             else:
                 masks = sem_seg[0] == labels[:, None, None]
+            # print("MASK: ", masks)
             masks = masks.astype(np.uint8)
             for mask_num in range(len(labels)):
                 classes_id = labels[mask_num]
@@ -176,10 +182,140 @@ class SegLocalVisualizer(Visualizer):
                 mask = cv2.putText(mask, text, (loc[0], loc[1] + label_height),
                                    font, fontScale, fontColor, thickness,
                                    lineType)
+                
         color_seg = (image * (1 - self.alpha) + mask * self.alpha).astype(
             np.uint8)
         self.set_image(color_seg)
         return color_seg
+    
+    import time
+    
+    def _draw_sem_seg_GPU(self,
+                        image: np.ndarray,
+                        sem_seg: PixelData,
+                        classes: Optional[List],
+                        palette: Optional[List],
+                        with_labels: Optional[bool] = True,
+                        print_timings: bool = True) -> np.ndarray:
+        """Draw semantic segmentation of GT or prediction using GPU where possible.
+
+        Args:
+            image (np.ndarray): The image to draw.
+            sem_seg (:obj:`PixelData`): Data structure for pixel-level annotations or predictions.
+            classes (list, optional): Input classes for result rendering.
+            palette (list, optional): Input palette for result rendering.
+            with_labels(bool, optional): Add semantic labels in visualization result.
+            print_timings (bool): Flag to print timings for various steps.
+
+        Returns:
+            np.ndarray: The drawn image which channel is RGB.
+        """
+        
+        # Ensure sem_seg is a PyTorch tensor, and move it to the right device (GPU if available)
+        if isinstance(sem_seg, torch.Tensor):
+            device = sem_seg.device
+        else:
+            if hasattr(sem_seg, 'data'):  # Custom PixelData with 'data' attribute
+                sem_seg = torch.tensor(sem_seg.data, dtype=torch.long)
+            else:
+                raise ValueError("PixelData does not have a 'data' attribute or is not in an expected format.")
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Move the image to the same device as sem_seg for GPU computation
+        image = torch.tensor(image).to(device)
+
+        if print_timings:
+            print(f"Using device: {device}")
+
+        # Timer for the initial setup (getting the number of classes and unique IDs)
+        start_time = time.time()
+        num_classes = len(classes)
+        ids = torch.unique(sem_seg)  # Get unique values from the tensor
+        ids = torch.flip(ids, dims=[0])  # Flip (reverse) the tensor along the first axis
+        ids = ids.to(device)  # Move the reversed tensor to the device (GPU or CPU)
+        
+        legal_indices = ids < num_classes  # Ensure IDs are valid
+        ids = ids[legal_indices]
+        labels = ids.to(torch.int64)
+
+        # Map labels to colors based on palette
+        colors = [palette[label] for label in labels]
+        mask = torch.zeros_like(image, dtype=torch.uint8, device=device)  # Create a mask on the same device
+        setup_time = time.time() - start_time
+        if print_timings:
+            print(f"Initial setup time: {setup_time:.4f} seconds")
+
+        # Timer for drawing the segmentation mask
+        start_time = time.time()
+        for label, color in zip(labels, colors):
+            mask[sem_seg[0] == label] = torch.tensor(color, dtype=torch.uint8, device=device)
+        drawing_mask_time = time.time() - start_time
+        if print_timings:
+            print(f"Mask drawing time: {drawing_mask_time:.4f} seconds")
+
+        # Timer for adding labels (if enabled)
+        label_drawing_time = 0
+        if with_labels:
+            start_time = time.time()
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = 0.05
+            fontScale = min(image.shape[0], image.shape[1]) / (25 / scale)
+            fontColor = (255, 255, 255)
+            thickness = 2 if image.shape[0] >= 300 and image.shape[1] >= 300 else 1
+            lineType = 2
+
+            # Use CPU for label drawing and text rendering to avoid unnecessary GPU overhead
+            masks = [(sem_seg[0] == label).cpu() for label in labels]  # Move mask computations to CPU
+            for mask_num, mask_for_label in enumerate(masks):
+                classes_id = labels[mask_num]
+                classes_color = colors[mask_num]
+                loc = self._get_center_loc(mask_for_label.numpy())  # Convert to CPU for OpenCV
+                text = classes[classes_id]
+
+                # Get text size and draw label
+                (label_width, label_height), baseline = cv2.getTextSize(text, font, fontScale, thickness)
+                mask_numpy = mask_for_label.numpy().astype(np.uint8)  # Convert to NumPy for OpenCV
+                mask_numpy = cv2.rectangle(mask_numpy, loc,
+                                        (loc[0] + label_width + baseline, loc[1] + label_height + baseline),
+                                        classes_color, -1)
+                mask_numpy = cv2.rectangle(mask_numpy, loc,
+                                        (loc[0] + label_width + baseline, loc[1] + label_height + baseline),
+                                        (0, 0, 0), thickness)  # Add border
+                mask_numpy = cv2.putText(mask_numpy, text, (loc[0], loc[1] + label_height),
+                                        font, fontScale, fontColor, thickness, lineType)
+
+                # Convert back to tensor after processing (if necessary)
+                mask[0] = torch.from_numpy(mask_numpy).to(device)
+
+            label_drawing_time = time.time() - start_time
+            if print_timings:
+                print(f"Label drawing time: {label_drawing_time:.4f} seconds")
+
+        # Timer for blending the segmentation mask with the original image
+        start_time = time.time()
+        color_seg = (image * (1 - self.alpha) + mask * self.alpha).to(torch.uint8)
+        blending_time = time.time() - start_time
+        if print_timings:
+            print(f"Blending time: {blending_time:.4f} seconds")
+
+        # Convert to numpy array before passing it to OpenCV
+        color_seg_np = color_seg.cpu().numpy()
+
+        # Timer for setting the image (if any additional processing is done here)
+        start_time = time.time()
+        self.set_image(color_seg_np)  # Now it's a NumPy array
+        set_image_time = time.time() - start_time
+        if print_timings:
+            print(f"Set image time: {set_image_time:.4f} seconds")
+
+        # Total time for the entire method
+        total_time = (setup_time + drawing_mask_time + label_drawing_time + 
+                    blending_time + set_image_time)
+        if print_timings:
+            print(f"Total time for _draw_sem_seg_GPU: {total_time:.4f} seconds")
+
+        return color_seg_np  # Return as NumPy array for display or further processing
+
 
     def _draw_depth_map(self, image: np.ndarray,
                         depth_map: PixelData) -> np.ndarray:
@@ -262,88 +398,107 @@ class SegLocalVisualizer(Visualizer):
             draw_pred: bool = True,
             show: bool = False,
             wait_time: float = 0,
-            # TODO: Supported in mmengine's Viusalizer.
             out_file: Optional[str] = None,
             step: int = 0,
-            with_labels: Optional[bool] = True) -> None:
-        """Draw datasample and save to all backends.
-
-        - If GT and prediction are plotted at the same time, they are
-        displayed in a stitched image where the left image is the
-        ground truth and the right image is the prediction.
-        - If ``show`` is True, all storage backends are ignored, and
-        the images will be displayed in a local window.
-        - If ``out_file`` is specified, the drawn image will be
-        saved to ``out_file``. it is usually used when the display
-        is not available.
-
-        Args:
-            name (str): The image identifier.
-            image (np.ndarray): The image to draw.
-            gt_sample (:obj:`SegDataSample`, optional): GT SegDataSample.
-                Defaults to None.
-            pred_sample (:obj:`SegDataSample`, optional): Prediction
-                SegDataSample. Defaults to None.
-            draw_gt (bool): Whether to draw GT SegDataSample. Default to True.
-            draw_pred (bool): Whether to draw Prediction SegDataSample.
-                Defaults to True.
-            show (bool): Whether to display the drawn image. Default to False.
-            wait_time (float): The interval of show (s). Defaults to 0.
-            out_file (str): Path to output file. Defaults to None.
-            step (int): Global step value to record. Defaults to 0.
-            with_labels(bool, optional): Add semantic labels in visualization
-                result, Defaults to True.
-        """
+            with_labels: Optional[bool] = True,
+            print_timings: bool = False
+        ) -> None:
+        """Draw datasample and save to all backends."""
+        
+        # Start the timer for dataset meta retrieval (getting classes/palette)
+        start_time = time.time()
         classes = self.dataset_meta.get('classes', None)
         palette = self.dataset_meta.get('palette', None)
+        meta_time = time.time() - start_time
+        if print_timings:
+            print(f"Dataset meta retrieval time: {meta_time:.4f} seconds")
+
+        # Initialize all time variables
+        gt_drawing_time = 0
+        gt_depth_time = 0
+        pred_drawing_time = 0
+        pred_depth_time = 0
+        concat_time = 0
+        show_time = 0
+        save_time = 0
+        add_image_time = 0
 
         gt_img_data = None
         pred_img_data = None
 
+        # Start timer for drawing ground truth
         if draw_gt and data_sample is not None:
             if 'gt_sem_seg' in data_sample:
-                assert classes is not None, 'class information is ' \
-                                            'not provided when ' \
-                                            'visualizing semantic ' \
-                                            'segmentation results.'
-                gt_img_data = self._draw_sem_seg(image, data_sample.gt_sem_seg,
-                                                 classes, palette, with_labels)
+                assert classes is not None, 'class information is not provided when visualizing semantic segmentation results.'
+                start_time = time.time()
+                gt_img_data = self._draw_sem_seg_GPU(image, data_sample.gt_sem_seg, classes, palette, with_labels=True)
+                gt_drawing_time = time.time() - start_time
+                if print_timings:
+                    print(f"Ground truth drawing time: {gt_drawing_time:.4f} seconds")
 
             if 'gt_depth_map' in data_sample:
                 gt_img_data = gt_img_data if gt_img_data is not None else image
-                gt_img_data = self._draw_depth_map(gt_img_data,
-                                                   data_sample.gt_depth_map)
+                start_time = time.time()
+                gt_img_data = self._draw_depth_map(gt_img_data, data_sample.gt_depth_map)
+                gt_depth_time = time.time() - start_time
+                if print_timings:
+                    print(f"Ground truth depth map drawing time: {gt_depth_time:.4f} seconds")
 
+        # Start timer for drawing prediction
         if draw_pred and data_sample is not None:
-
             if 'pred_sem_seg' in data_sample:
-
-                assert classes is not None, 'class information is ' \
-                                            'not provided when ' \
-                                            'visualizing semantic ' \
-                                            'segmentation results.'
-                pred_img_data = self._draw_sem_seg(image,
-                                                   data_sample.pred_sem_seg,
-                                                   classes, palette,
-                                                   with_labels)
+                assert classes is not None, 'class information is not provided when visualizing semantic segmentation results.'
+                start_time = time.time()
+                pred_img_data = self._draw_sem_seg(image, data_sample.pred_sem_seg, classes, palette, with_labels=True)
+                pred_drawing_time = time.time() - start_time
+                if print_timings:
+                    print(f"Prediction drawing time: {pred_drawing_time:.4f} seconds")
 
             if 'pred_depth_map' in data_sample:
-                pred_img_data = pred_img_data if pred_img_data is not None \
-                    else image
-                pred_img_data = self._draw_depth_map(
-                    pred_img_data, data_sample.pred_depth_map)
+                pred_img_data = pred_img_data if pred_img_data is not None else image
+                start_time = time.time()
+                pred_img_data = self._draw_depth_map(pred_img_data, data_sample.pred_depth_map)
+                pred_depth_time = time.time() - start_time
+                if print_timings:
+                    print(f"Prediction depth map drawing time: {pred_depth_time:.4f} seconds")
 
+        # Timer for concatenating the images
+        start_time = time.time()
         if gt_img_data is not None and pred_img_data is not None:
             drawn_img = np.concatenate((gt_img_data, pred_img_data), axis=1)
         elif gt_img_data is not None:
             drawn_img = gt_img_data
         else:
             drawn_img = pred_img_data
+        concat_time = time.time() - start_time
+        if print_timings:
+            print(f"Image concatenation time: {concat_time:.4f} seconds")
 
+        # Timer for showing the image
         if show:
+            start_time = time.time()
             self.show(drawn_img, win_name=name, wait_time=wait_time)
+            show_time = time.time() - start_time
+            if print_timings:
+                print(f"Show image time: {show_time:.4f} seconds")
 
+        # Timer for saving the image (if needed)
         if out_file is not None:
+            start_time = time.time()
             mmcv.imwrite(mmcv.rgb2bgr(drawn_img), out_file)
+            save_time = time.time() - start_time
+            if print_timings:
+                print(f"Saving image time: {save_time:.4f} seconds")
         else:
+            start_time = time.time()
             self.add_image(name, drawn_img, step)
+            add_image_time = time.time() - start_time
+            if print_timings:
+                print(f"Add image time: {add_image_time:.4f} seconds")
+
+        # Total time for the entire function
+        total_time = (meta_time + gt_drawing_time + gt_depth_time + 
+                    pred_drawing_time + pred_depth_time + concat_time + 
+                    show_time + save_time + add_image_time)
+        if print_timings:
+            print(f"Total time for add_datasample: {total_time:.4f} seconds")

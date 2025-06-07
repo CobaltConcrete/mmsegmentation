@@ -2,7 +2,7 @@
 
 REQUIRED_MEM_MB=5000     # Change this as needed
 GPU_ID=0                 # GPU ID to monitor
-VIDEO_LIST="/home/r13qingrong/Projects/URECA/mmsegmentation/demo/scripts/scriptsleft1.txt"
+VIDEO_LIST="/home/r13qingrong/Projects/URECA/mmsegmentation/demo/VSPWvideofiles_filtered.txt"
 
 wait_for_gpu() {
     echo "Waiting for $REQUIRED_MEM_MB MB of GPU $GPU_ID memory..."
